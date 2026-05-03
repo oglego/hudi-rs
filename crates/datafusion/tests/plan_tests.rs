@@ -322,6 +322,39 @@ mod v8_tests {
     }
 
     #[tokio::test]
+    async fn test_v8_nonpartitioned_clustered_read() {
+        let test_table = SampleTable::V8NonpartitionedClustered;
+        
+        let ctx = register_table_direct(&test_table, [("", ""); 0])
+            .await
+            .unwrap();
+
+        let sql = format!(
+            "SELECT id, name, isActive FROM {} ORDER BY id",
+            test_table.as_ref()
+        );
+
+        // Verify the Execution Plan uses DataSourceExec and sees exactly 1 file
+        let df = ctx.sql(&sql).await.unwrap();
+        let plan_df = df.clone().explain(false, false).unwrap();
+        let plan_results = plan_df.collect().await.unwrap();
+        let plan = get_str_column(plan_results.first().unwrap(), "plan").join("");
+        
+        assert!(plan.contains("DataSourceExec"), "Should use DataSourceExec");
+        assert!(plan.contains("1 group"), "Clustering should have consolidated data into 1 file group");
+
+        // Verify Data Content
+        let rb = df.collect().await.unwrap();
+        let batch = rb.first().expect("Record batch should not be empty");
+        let data = SampleTable::sample_data_order_by_id(batch);
+        
+        assert_eq!(data.len(), 3);
+        assert_eq!(data[0], (1, "Initial", true));
+        assert_eq!(data[1], (2, "Second", false));
+        assert_eq!(data[2], (3, "Clustered_Entry", true));
+    }
+    
+    #[tokio::test]
     async fn test_v8_partitioned_filter_pushdown() {
         let test_table = V8SimplekeygenNonhivestyle;
         println!(">>> testing V8 for {}", test_table.as_ref());

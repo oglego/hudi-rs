@@ -123,6 +123,7 @@ pub enum SampleTable {
     V8ComplexkeygenHivestyle,
     V8Empty,
     V8Nonpartitioned,
+    V8NonpartitionedClustered,
     V8SimplekeygenHivestyleNoMetafields,
     V8SimplekeygenNonhivestyle,
     V9NonpartitionedRollback,

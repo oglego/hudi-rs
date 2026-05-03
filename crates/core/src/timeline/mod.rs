@@ -413,6 +413,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_timeline_v8_nonpartitioned_clustered() {
+        let base_url = SampleTable::V8NonpartitionedClustered.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+        assert_eq!(timeline.completed_commits.len(), 3);
+        assert!(timeline.active_loader.is_layout_two_active());
+        // Verify the clustering action specifically
+        // We want to ensure the timeline sees the replacecommit
+        let replace_commits: Vec<_> = timeline.completed_commits
+            .iter()
+            .filter(|i| i.action == Action::ReplaceCommit)
+            .collect();
+        assert_eq!(replace_commits.len(), 1, "Should identify exactly one clustering action");
+        assert_eq!(replace_commits[0].state, State::Completed);
+    }
+
+    #[tokio::test]
     async fn test_timeline_v8_with_archived_enabled() {
         use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
 
