@@ -126,6 +126,7 @@ pub enum SampleTable {
     V8NonpartitionedClustered,
     V8SimplekeygenHivestyleNoMetafields,
     V8SimplekeygenNonhivestyle,
+    V8SimplekeygenNonpartitionedAsyncCompaction,
     V9NonpartitionedRollback,
     V9TimebasedkeygenEpochmillis,
     V9TimebasedkeygenNonhivestyle,

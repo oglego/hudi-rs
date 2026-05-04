@@ -429,6 +429,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_timeline_v8_mor_async_compaction_requested() {
+        let base_url = SampleTable::V8SimplekeygenNonpartitionedAsyncCompaction.url_to_mor_parquet();
+        let timeline = create_test_timeline(base_url).await;
+
+        // Use our new selector that specifically allows Requested/Inflight Compaction
+        let selector = TimelineSelector::pending_compaction_in_range(
+            timeline.hudi_configs.clone(),
+            None,
+            None,
+        ).expect("Failed to create pending compaction selector");
+
+        // Load from active_loader
+        let instants = timeline.active_loader.load_instants(&selector, false).await.unwrap();
+        
+        let compaction_requested = instants.iter().find(|i| 
+            i.action == Action::Compaction && i.state == State::Requested
+        );
+        
+        assert!(
+            compaction_requested.is_some(), 
+            "Loader should now find the .compaction.requested file. Found: {:?}", 
+            instants
+        );
+        
+        let instant = compaction_requested.unwrap();
+        assert_eq!(instant.timestamp, "20260503143712985");
+    }
+
+    #[tokio::test]
     async fn test_timeline_v8_with_archived_enabled() {
         use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
 

@@ -222,6 +222,14 @@ impl TimelineSelector {
         Self::completed_actions_in_range(&[Action::ReplaceCommit], hudi_configs, start, end)
     }
 
+    pub fn pending_compaction_in_range(
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
+        Self::completed_actions_in_range(&[Action::Compaction], hudi_configs, start, end)
+    }
+
     /// Whether the selector has any time filter (start or end) applied.
     pub fn has_time_filter(&self) -> bool {
         self.start_datetime.is_some() || self.end_datetime.is_some()

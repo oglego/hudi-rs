@@ -31,6 +31,7 @@ pub enum Action {
     Commit,
     DeltaCommit,
     ReplaceCommit,
+    Compaction,
 }
 
 impl FromStr for Action {
@@ -41,6 +42,7 @@ impl FromStr for Action {
             "commit" => Ok(Action::Commit),
             "deltacommit" => Ok(Action::DeltaCommit),
             "replacecommit" => Ok(Action::ReplaceCommit),
+            "compaction" => Ok(Action::Compaction),
             _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
@@ -52,6 +54,7 @@ impl AsRef<str> for Action {
             Action::Commit => "commit",
             Action::DeltaCommit => "deltacommit",
             Action::ReplaceCommit => "replacecommit",
+            Action::Compaction => "compaction",
         }
     }
 }
@@ -59,6 +62,10 @@ impl AsRef<str> for Action {
 impl Action {
     pub fn is_replacecommit(&self) -> bool {
         self == &Action::ReplaceCommit
+    }
+
+    pub fn is_compaction(&self) -> bool {
+        self == &Action::Compaction
     }
 }
 
