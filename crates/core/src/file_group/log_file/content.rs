@@ -27,7 +27,7 @@ use crate::file_group::log_file::log_block::{
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
+use crate::schema::delete::avro_schema_for_delete_record_list;
 use apache_avro::{Schema as AvroSchema, from_avro_datum};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
@@ -205,8 +205,21 @@ impl Decoder {
         }
 
         // Generate schema based on the first delete record
-        let first_record = &delete_records[0];
-        let delete_record_schema = avro_schema_for_delete_record(first_record)?;
+        let delete_record_schema = match avro_schema_for_delete_record_list()? {
+            AvroSchema::Record(record_schema) => match &record_schema.fields[0].schema {
+                AvroSchema::Array(array_schema) => array_schema.items.as_ref().clone(),
+                _ => {
+                    return Err(CoreError::LogBlockError(
+                        "Expected array schema for deleteRecordList".to_string(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(CoreError::LogBlockError(
+                    "Expected record schema for delete record list".to_string(),
+                ));
+            }
+        };
 
         let num_delete_batches = delete_records.len() / self.batch_size + 1;
         let mut batches = RecordBatches::new_with_capacity(0, num_delete_batches);
@@ -270,6 +283,7 @@ mod tests {
     use super::*;
     use apache_avro::to_avro_datum;
     use apache_avro::types::Record as AvroRecord;
+    use apache_avro::types::Value as AvroValue;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
@@ -391,6 +405,140 @@ mod tests {
         let batches = decoder.decode_parquet_record_content(&mut reader)?;
         assert_eq!(batches.num_data_batches(), 1);
         assert_eq!(batches.num_data_rows(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_delete_content_with_multi_type_union_ordering_val() -> Result<()> {
+        use arrow::array::UnionArray;
+
+        // Three records with different orderingVal union variants:
+        // index 2 = long, index 6 = string, index 0 = null
+        let delete_records = vec![
+            AvroValue::Record(vec![
+                (
+                    "recordKey".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String("key1".to_string()))),
+                ),
+                (
+                    "partitionPath".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String("p1".to_string()))),
+                ),
+                (
+                    "orderingVal".to_string(),
+                    AvroValue::Union(2, Box::new(AvroValue::Long(100))),
+                ),
+            ]),
+            AvroValue::Record(vec![
+                (
+                    "recordKey".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String("key2".to_string()))),
+                ),
+                (
+                    "partitionPath".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String("p2".to_string()))),
+                ),
+                (
+                    "orderingVal".to_string(),
+                    AvroValue::Union(6, Box::new(AvroValue::String("v2".to_string()))),
+                ),
+            ]),
+            AvroValue::Record(vec![
+                (
+                    "recordKey".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String("key3".to_string()))),
+                ),
+                (
+                    "partitionPath".to_string(),
+                    AvroValue::Union(0, Box::new(AvroValue::Null)),
+                ),
+                (
+                    "orderingVal".to_string(),
+                    AvroValue::Union(0, Box::new(AvroValue::Null)),
+                ),
+            ]),
+        ];
+
+        // Wrap in the deleteRecordList envelope and serialize
+        let del_list_schema = avro_schema_for_delete_record_list()?;
+        let delete_record_list = AvroValue::Record(vec![(
+            "deleteRecordList".to_string(),
+            AvroValue::Array(delete_records),
+        )]);
+        let serialized = apache_avro::to_avro_datum(del_list_schema, delete_record_list)
+            .map_err(CoreError::AvroError)?;
+
+        // Build raw block bytes: [4-byte V3 version][4-byte content length][avro bytes]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&(serialized.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&serialized);
+
+        let hudi_configs = HudiConfigs::empty();
+        let decoder = Decoder::new(Arc::new(hudi_configs));
+        let mut reader = Cursor::new(buf);
+
+        let mut header = HashMap::new();
+        header.insert(BlockMetadataKey::InstantTime, "20240101000000".to_string());
+
+        let batches = decoder.decode_delete_record_content(&mut reader, &header)?;
+
+        assert_eq!(batches.num_delete_batches(), 1);
+        assert_eq!(batches.num_delete_rows(), 3);
+
+        let batch = &batches.delete_batches[0];
+
+        // recordKey: all three should be present
+        let record_key_array = batch
+            .0
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(record_key_array.value(0), "key1");
+        assert_eq!(record_key_array.value(1), "key2");
+        assert_eq!(record_key_array.value(2), "key3");
+
+        // partitionPath: third row should be null
+        let partition_path_array = batch
+            .0
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(partition_path_array.value(0), "p1");
+        assert_eq!(partition_path_array.value(1), "p2");
+        assert!(partition_path_array.is_null(2));
+
+        // orderingVal: should be a UnionArray with mixed type_ids
+        let ordering_val_array = batch
+            .0
+            .column(2)
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .unwrap();
+
+        // row 0: type_id 2 (long), value 100
+        assert_eq!(ordering_val_array.type_id(0), 2);
+        let long_child = ordering_val_array
+            .child(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(long_child.value(0), 100);
+
+        // row 1: type_id 6 (string), value "v2"
+        assert_eq!(ordering_val_array.type_id(1), 6);
+        let string_child = ordering_val_array
+            .child(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(string_child.value(0), "v2");
+
+        // row 2: type_id 0 (null)
+        assert_eq!(ordering_val_array.type_id(2), 0);
 
         Ok(())
     }

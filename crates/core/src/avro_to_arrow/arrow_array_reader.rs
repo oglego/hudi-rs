@@ -31,14 +31,14 @@ use arrow::array::{
     ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StringBuilder,
     StringDictionaryBuilder, make_array,
 };
-use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
+use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray, UnionArray};
 use arrow::buffer::{Buffer, MutableBuffer};
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNumericType, ArrowPrimitiveType, DataType, Date32Type, Date64Type,
-    Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Decimal128Type, Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
     Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type, UnionFields, UnionMode,
 };
 use arrow::datatypes::{Fields, SchemaRef};
 use arrow::error::ArrowError;
@@ -730,6 +730,9 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             .build()?;
                         make_array(data)
                     }
+                    DataType::Union(union_fields, mode) => {
+                        self.build_union_array(rows, &field_path, union_fields, *mode)?
+                    }
                     _ => {
                         return Err(SchemaError(format!(
                             "type {} not supported",
@@ -741,6 +744,180 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             })
             .collect();
         arrays
+    }
+
+    fn build_union_array(
+        &self,
+        rows: RecordSlice,
+        col_name: &str,
+        union_fields: &UnionFields,
+        mode: UnionMode,
+    ) -> ArrowResult<ArrayRef> {
+        let num_rows = rows.len();
+        let num_variants = union_fields.len();
+
+        let mut type_ids: Vec<i8> = Vec::with_capacity(num_rows);
+        let mut offsets: Vec<i32> = Vec::with_capacity(num_rows);
+        let mut per_type_counts: Vec<i32> = vec![0; num_variants];
+        // collect raw values per variant
+        let mut per_type_values: Vec<Vec<Option<Value>>> =
+            (0..num_variants).map(|_| vec![]).collect();
+
+        for row in rows {
+            match self.field_lookup(col_name, row) {
+                Some(Value::Union(idx, inner)) => {
+                    let i = *idx as usize;
+                    type_ids.push(*idx as i8);
+                    offsets.push(per_type_counts[i]);
+                    per_type_counts[i] += 1;
+                    per_type_values[i].push(Some(*inner.clone()));
+                }
+                Some(Value::Null) | None => {
+                    // null maps to type slot 0 (always Null in Hudi delete schema)
+                    type_ids.push(0);
+                    offsets.push(per_type_counts[0]);
+                    per_type_counts[0] += 1;
+                    per_type_values[0].push(None);
+                }
+                other => {
+                    return Err(SchemaError(format!(
+                        "Expected Union value for field {col_name}, got {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Build one child array per variant
+        let child_arrays: ArrowResult<Vec<ArrayRef>> = union_fields
+            .iter()
+            .enumerate()
+            .map(|(i, (_, field))| {
+                let vals = &per_type_values[i];
+                let len = vals.len();
+                let arr: ArrayRef = match field.data_type() {
+                    DataType::Null => Arc::new(NullArray::new(len)),
+                    DataType::Boolean => {
+                        let mut b = BooleanBuilder::with_capacity(len);
+                        for v in vals {
+                            match v.as_ref().and_then(|val| resolve_boolean(val)) {
+                                Some(bv) => b.append_value(bv),
+                                None => b.append_null(),
+                            }
+                        }
+                        Arc::new(b.finish())
+                    }
+                    DataType::Int32 => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Int32Type>(val)))
+                            .collect::<PrimitiveArray<Int32Type>>(),
+                    ),
+                    DataType::Int64 => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Int64Type>(val)))
+                            .collect::<PrimitiveArray<Int64Type>>(),
+                    ),
+                    DataType::Float32 => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Float32Type>(val)))
+                            .collect::<PrimitiveArray<Float32Type>>(),
+                    ),
+                    DataType::Float64 => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Float64Type>(val)))
+                            .collect::<PrimitiveArray<Float64Type>>(),
+                    ),
+                    DataType::Utf8 => Arc::new(
+                        vals.iter()
+                            .map(|v| {
+                                v.as_ref()
+                                    .and_then(|val| resolve_string(val).ok().flatten())
+                            })
+                            .collect::<StringArray>(),
+                    ),
+                    DataType::Binary => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_bytes(val)))
+                            .collect::<BinaryArray>(),
+                    ),
+                    DataType::Date32 => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Date32Type>(val)))
+                            .collect::<PrimitiveArray<Date32Type>>(),
+                    ),
+                    DataType::Date64 => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Date64Type>(val)))
+                            .collect::<PrimitiveArray<Date64Type>>(),
+                    ),
+                    DataType::Time32(_) => Arc::new(
+                        vals.iter()
+                            .map(|v| {
+                                v.as_ref()
+                                    .and_then(|val| resolve_item::<Time32MillisecondType>(val))
+                            })
+                            .collect::<PrimitiveArray<Time32MillisecondType>>(),
+                    ),
+                    DataType::Time64(_) => Arc::new(
+                        vals.iter()
+                            .map(|v| {
+                                v.as_ref()
+                                    .and_then(|val| resolve_item::<Time64MicrosecondType>(val))
+                            })
+                            .collect::<PrimitiveArray<Time64MicrosecondType>>(),
+                    ),
+                    DataType::Timestamp(TimeUnit::Millisecond, _) => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<TimestampMillisecondType>(val)))
+                            .collect::<PrimitiveArray<TimestampMillisecondType>>(),
+                    ),
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<TimestampMicrosecondType>(val)))
+                            .collect::<PrimitiveArray<TimestampMicrosecondType>>(),
+                    ),
+                    DataType::Timestamp(TimeUnit::Second, _) => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<TimestampSecondType>(val)))
+                            .collect::<PrimitiveArray<TimestampSecondType>>(),
+                    ),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
+                        vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<TimestampNanosecondType>(val)))
+                            .collect::<PrimitiveArray<TimestampNanosecondType>>(),
+                    ),
+                    DataType::Decimal128(precision, scale) => {
+                        eprintln!("hitting decimal arm with precision={precision} scale={scale}");
+                        use arrow::array::Decimal128Array;
+                        let values: Vec<Option<i128>> = vals.iter()
+                            .map(|v| v.as_ref().and_then(|val| resolve_item::<Decimal128Type>(val).map(|n| n as i128)))
+                            .collect();
+                        let array = Decimal128Array::from(values)
+                            .with_precision_and_scale(*precision, *scale)
+                            .map_err(|e| SchemaError(format!("Failed to set decimal precision/scale: {e}")))?;
+                        Arc::new(array)
+                    }
+                    dt => {
+                        return Err(SchemaError(format!(
+                            "Union variant type {dt} not yet supported"
+                        )));
+                    }
+                };
+                Ok(arr)
+            })
+            .collect();
+
+        let child_arrays = child_arrays?;
+        let type_id_buffer = Buffer::from_slice_ref(&type_ids);
+        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+
+        let data = ArrayData::builder(DataType::Union(union_fields.clone(), mode))
+            .len(num_rows)
+            .add_buffer(type_id_buffer)
+            .add_buffer(offsets_buffer)
+            .child_data(child_arrays.iter().map(|a| a.to_data()).collect())
+            .build()?;
+
+        Ok(Arc::new(arrow::array::UnionArray::from(data)))
     }
 
     /// Read the primitive list's values into ArrayData
