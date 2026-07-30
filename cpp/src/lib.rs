@@ -51,11 +51,13 @@ mod ffi {
             self: &HudiFileGroupReader,
             base_file_path: &CxxString,
             log_file_paths: &CxxVector<CxxString>,
+            options: &CxxVector<CxxString>,
         ) -> Result<*mut ArrowArrayStream>;
 
         fn read_file_slice(
             self: &HudiFileGroupReader,
             file_slice: &HudiFileSlice,
+            options: &CxxVector<CxxString>,
         ) -> Result<*mut ArrowArrayStream>;
     }
 }
@@ -63,6 +65,37 @@ mod ffi {
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
     rt: tokio::runtime::Runtime,
+}
+
+/// Reserved key: a comma-separated column list that maps to [`ReadOptions::with_projection`].
+/// Every other `key=value` pair is forwarded verbatim via [`ReadOptions::with_hudi_option`].
+const PROJECTION_OPTION_KEY: &str = "projection";
+
+/// Parses a flat `key=value` option list (the same shape used by
+/// `new_file_group_reader_with_options`) into a [`ReadOptions`], so slice reads
+/// through the FFI can carry a projection (and, in the future, other per-read
+/// knobs) instead of always reading with `ReadOptions::new()`.
+fn parse_read_options(options: &CxxVector<CxxString>) -> std::result::Result<ReadOptions, String> {
+    let mut read_options = ReadOptions::new();
+    for opt in options.iter() {
+        let opt_str = opt
+            .to_str()
+            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+        let Some((key, value)) = opt_str.split_once('=') else {
+            continue;
+        };
+        if key == PROJECTION_OPTION_KEY {
+            let columns = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            read_options = read_options.with_projection(columns);
+        } else {
+            read_options = read_options.with_hudi_option(key, value);
+        }
+    }
+    Ok(read_options)
 }
 
 pub fn new_file_group_reader_with_options(
@@ -98,6 +131,7 @@ impl HudiFileGroupReader {
         &self,
         base_file_path: &CxxString,
         log_file_paths: &CxxVector<CxxString>,
+        options: &CxxVector<CxxString>,
     ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let base_file_path = base_file_path
             .to_str()
@@ -112,12 +146,14 @@ impl HudiFileGroupReader {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let read_options = parse_read_options(options)?;
+
         let record_batch = self
             .rt
             .block_on(self.inner.read_file_slice_from_paths(
                 base_file_path,
                 log_file_paths,
-                &ReadOptions::new(),
+                &read_options,
             ))
             .map_err(|e| format!("Failed to read file batch: {e}"))?;
         let schema = record_batch.schema();
@@ -131,12 +167,15 @@ impl HudiFileGroupReader {
     pub fn read_file_slice(
         &self,
         file_slice: &HudiFileSlice,
+        options: &CxxVector<CxxString>,
     ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+        let read_options = parse_read_options(options)?;
+
         let record_batch = self
             .rt
             .block_on(
                 self.inner
-                    .read_file_slice(&file_slice.inner, &ReadOptions::new()),
+                    .read_file_slice(&file_slice.inner, &read_options),
             )
             .map_err(|e| format!("Failed to read file slice: {e}"))?;
         let schema = record_batch.schema();

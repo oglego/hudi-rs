@@ -143,7 +143,10 @@ int main() {
 
         auto base_file_path = "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
         std::vector<std::string> log_file_paths{};
-        ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_from_paths(base_file_path, log_file_paths);
+        // Example: pass a column projection via the reserved "projection=col1,col2" key.
+        // Leave this empty to read all columns.
+        std::vector<std::string> read_opts{};
+        ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_from_paths(base_file_path, log_file_paths, read_opts);
 
         if (!stream_ptr) {
             std::cerr << "Error: Received null stream pointer" << std::endl;
