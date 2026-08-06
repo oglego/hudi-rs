@@ -338,7 +338,7 @@ impl FilePruner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{Date32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
 
@@ -378,6 +378,20 @@ mod tests {
                 data_type: DataType::Utf8,
                 min_value: Some(Arc::new(StringArray::from(vec![min])) as ArrayRef),
                 max_value: Some(Arc::new(StringArray::from(vec![max])) as ArrayRef),
+            },
+        );
+        stats
+    }
+
+    fn create_stats_with_date_range(col_name: &str, min: i32, max: i32) -> StatisticsContainer {
+        let mut stats = StatisticsContainer::new(crate::statistics::StatsGranularity::File);
+        stats.columns.insert(
+            col_name.to_string(),
+            ColumnStatistics {
+                column_name: col_name.to_string(),
+                data_type: DataType::Date32,
+                min_value: Some(Arc::new(Date32Array::from(vec![min])) as ArrayRef),
+                max_value: Some(Arc::new(Date32Array::from(vec![max])) as ArrayRef),
             },
         );
         stats
@@ -662,6 +676,22 @@ mod tests {
         // Stats: min=10, max=100. Filter: id >= 50. Should include (some values >= 50).
         let stats = create_stats_with_int_range("id", 10, 100);
         assert!(pruner.should_include(&stats));
+    }
+
+    #[test]
+    fn test_date_filter_uses_arrow_casted_values() {
+        let table_schema = create_test_schema();
+        let partition_schema = Schema::empty();
+
+        let filters = vec![Filter::try_from(("date", "=", "2024-01-15")).unwrap()];
+        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+
+        // The filter string is cast to Date32 using Arrow semantics before pruning.
+        let in_range_stats = create_stats_with_date_range("date", 19723, 19753);
+        assert!(pruner.should_include(&in_range_stats));
+
+        let out_of_range_stats = create_stats_with_date_range("date", 19754, 19754);
+        assert!(!pruner.should_include(&out_of_range_stats));
     }
 
     #[test]
