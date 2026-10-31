@@ -147,6 +147,42 @@ pub enum HudiTableConfig {
     MetadataTablePartitions,
 }
 
+impl HudiTableConfig {
+    /// Returns whether this config is fixed at table creation and persisted in `hoodie.properties`.
+    /// Conflicting user-provided values are rejected when building the table. Other configs are
+    /// exempt from conflict checks, and persisted values take precedence.
+    pub fn is_immutable(&self) -> bool {
+        match self {
+            Self::BaseFileFormat => true,
+            // Builder supplied or writer computed.
+            Self::BasePath | Self::Checksum => false,
+            // Schema recorded at table creation.
+            Self::CreateSchema => false,
+            // Reader-side hint for incremental queries.
+            Self::DatabaseName => false,
+            Self::DropsPartitionFields
+            | Self::IsHiveStylePartitioning
+            | Self::IsPartitionPathUrlencoded
+            | Self::KeyGeneratorClass
+            | Self::KeyGeneratorType
+            | Self::PartitionFields
+            | Self::OrderingFields
+            | Self::PopulatesMetaFields
+            | Self::RecordKeyFields
+            | Self::RecordMergeStrategy
+            | Self::TableName
+            | Self::TableType
+            | Self::TableVersion
+            | Self::TimelineLayoutVersion
+            | Self::TimelineTimezone => true,
+            // Timeline paths may be customized.
+            Self::ArchiveLogFolder | Self::TimelinePath | Self::TimelineHistoryPath => false,
+            // Writer-changeable; the persisted value still wins for readers.
+            Self::MetadataTableEnabled | Self::MetadataTablePartitions => false,
+        }
+    }
+}
+
 impl AsRef<str> for HudiTableConfig {
     fn as_ref(&self) -> &str {
         match self {

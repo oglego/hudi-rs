@@ -52,4 +52,12 @@ pub enum ConfigError {
     /// UnsupportedValue(message): the value is valid but not supported by hudi-rs.
     #[error("Config value '{0}' is not supported")]
     UnsupportedValue(String),
+
+    /// ConflictWithTableProperty(key, user_value, table_value): a user-provided value differs
+    /// from the immutable value persisted in the table's `hoodie.properties`.
+    #[error(
+        "Config '{0}' was set to '{1}' but the table persists '{2}' in hoodie.properties; \
+         this table property cannot be overridden"
+    )]
+    ConflictWithTableProperty(String, String, String),
 }

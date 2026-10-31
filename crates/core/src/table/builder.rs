@@ -25,11 +25,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::config::error::ConfigError;
 use crate::config::properties::parse_properties;
 use crate::config::read::{HudiReadConfig, ReadConfigScope};
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
-use crate::config::{HUDI_CONF_DIR, HudiConfigs};
+use crate::config::{ConfigParser, HUDI_CONF_DIR, HudiConfigs};
 use crate::storage::Storage;
 use crate::table::Table;
 use crate::table::fs_view::FileSystemView;
@@ -317,14 +318,57 @@ impl OptionResolver {
     ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let table_properties = parse_properties(&bytes)?;
+        Self::merge_table_properties(options, table_properties)
+    }
 
-        // Table properties on storage (hoodie.properties) should have the highest precedence,
-        // except for writer-changeable properties like enabling metadata table/indexes.
-        // TODO: return err when user-provided options conflict with table properties
-        for (k, v) in table_properties {
-            options.insert(k.to_string(), v.to_string());
+    fn merge_table_properties(
+        options: &mut HashMap<String, String>,
+        table_properties: HashMap<String, String>,
+    ) -> Result<()> {
+        // Reject conflicting overrides for immutable table properties.
+        Self::validate_no_conflicts_with_table_properties(options, &table_properties)?;
+
+        // Stored properties take precedence, including writer-changeable metadata partitions.
+        options.extend(table_properties);
+
+        Ok(())
+    }
+
+    /// Reject conflicting user values for immutable table configs, including aliases.
+    fn validate_no_conflicts_with_table_properties(
+        user_options: &HashMap<String, String>,
+        table_properties: &HashMap<String, String>,
+    ) -> Result<()> {
+        use strum::IntoEnumIterator;
+
+        for config in HudiTableConfig::iter().filter(HudiTableConfig::is_immutable) {
+            let (Ok(user_raw), Ok(table_raw)) = (
+                config.resolve_raw_value(user_options),
+                config.resolve_raw_value(table_properties),
+            ) else {
+                // Both values must be present to conflict.
+                continue;
+            };
+
+            // Parsed values use config-specific equality; unparseable values compare trimmed
+            // and case-insensitively.
+            let same = match (
+                config.parse_value(user_options),
+                config.parse_value(table_properties),
+            ) {
+                (Ok(user), Ok(table)) => user == table,
+                _ => user_raw.trim().eq_ignore_ascii_case(table_raw.trim()),
+            };
+
+            if !same {
+                return Err(ConfigError::ConflictWithTableProperty(
+                    config.key(),
+                    user_raw.to_string(),
+                    table_raw.to_string(),
+                )
+                .into());
+            }
         }
-
         Ok(())
     }
 
@@ -356,6 +400,7 @@ impl OptionResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hudi_test::SampleTable;
     use serial_test::serial;
 
     fn create_table_builder() -> TableBuilder {
@@ -452,6 +497,167 @@ mod tests {
             resolver.storage_options["AWS_ENDPOINT"],
             "s3.us-east-1.amazonaws.com"
         );
+    }
+
+    fn map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_conflict_with_immutable_table_property_is_error() {
+        let table = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+        let user = map(&[("hoodie.table.type", "MERGE_ON_READ")]);
+
+        let err =
+            OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hoodie.table.type"), "{msg}");
+        assert!(msg.contains("MERGE_ON_READ"), "{msg}");
+        assert!(msg.contains("COPY_ON_WRITE"), "{msg}");
+    }
+
+    #[test]
+    fn test_matching_immutable_value_is_ok() {
+        let table = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+        let user = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_equivalent_spellings_are_not_conflicts() {
+        let table = map(&[("hoodie.populate.meta.fields", "true")]);
+        let user = map(&[("hoodie.populate.meta.fields", "TRUE")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_case_sensitive_string_conflict_is_detected() {
+        let table = map(&[(
+            "hoodie.table.keygenerator.class",
+            "org.apache.hudi.keygen.SimpleKeyGenerator",
+        )]);
+        let user = map(&[(
+            "hoodie.table.keygenerator.class",
+            "org.apache.hudi.keygen.simplekeygenerator",
+        )]);
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_err()
+        );
+    }
+
+    #[test]
+    fn test_whitespace_in_string_conflict_is_detected() {
+        let table = map(&[("hoodie.table.keygenerator.class", "SimpleKeyGenerator")]);
+        let user = map(&[("hoodie.table.keygenerator.class", " SimpleKeyGenerator")]);
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_err()
+        );
+    }
+
+    #[test]
+    fn test_conflict_is_detected_through_alias() {
+        let alias = HudiTableConfig::OrderingFields.aliases()[0].key;
+        let table = map(&[(HudiTableConfig::OrderingFields.as_ref(), "ts")]);
+
+        let same = map(&[(alias, "ts")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&same, &table).is_ok());
+
+        let different = map(&[(alias, "other_ts")]);
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(&different, &table)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_writer_changeable_and_unset_options_do_not_conflict() {
+        let table = map(&[
+            ("hoodie.table.type", "COPY_ON_WRITE"),
+            ("hoodie.table.metadata.partitions", "files"),
+        ]);
+        // Tunable config differs from the table, and an immutable config is unset on one side.
+        let user = map(&[
+            ("hoodie.table.metadata.partitions", "files,record_index"),
+            ("hoodie.table.name", "t"),
+        ]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_table_properties_take_precedence_over_non_immutable_user_options() {
+        let mut options = map(&[
+            ("hoodie.table.metadata.partitions", "files,record_index"),
+            ("hoodie.table.type", "COPY_ON_WRITE"),
+        ]);
+        let table_properties = map(&[
+            ("hoodie.table.metadata.partitions", "files"),
+            ("hoodie.table.type", "COPY_ON_WRITE"),
+        ]);
+
+        OptionResolver::merge_table_properties(&mut options, table_properties).unwrap();
+
+        assert_eq!(options["hoodie.table.metadata.partitions"], "files");
+    }
+
+    #[test]
+    fn test_merge_leaves_options_untouched_on_conflict() {
+        let mut options = map(&[("hoodie.table.type", "MERGE_ON_READ")]);
+        let table_properties = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+
+        assert!(OptionResolver::merge_table_properties(&mut options, table_properties).is_err());
+        assert_eq!(options["hoodie.table.type"], "MERGE_ON_READ");
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_option_conflicting_with_table_properties() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let mut builder = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option("hoodie.table.type", "MERGE_ON_READ");
+
+        let Err(err) = builder.build().await else {
+            panic!("a conflicting hoodie.table.type must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("hoodie.table.type"), "{msg}");
+        assert!(msg.contains("MERGE_ON_READ"), "{msg}");
+        assert!(msg.contains("COPY_ON_WRITE"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_build_accepts_option_matching_table_properties() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let mut builder = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option("hoodie.table.type", "COPY_ON_WRITE");
+
+        assert!(builder.build().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_detects_conflict_through_alias() {
+        // The fixture persists the ordering field under the legacy
+        // `hoodie.table.precombine.field` key.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let ordering_key = HudiTableConfig::OrderingFields.as_ref();
+
+        let mut same = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option(ordering_key, "longField");
+        assert!(same.build().await.is_ok());
+
+        let mut different =
+            TableBuilder::from_base_uri(base_url.path()).with_hudi_option(ordering_key, "intField");
+        assert!(different.build().await.is_err());
+    }
+
+    #[test]
+    fn test_immutable_classification() {
+        // Injected/computed configs must never be immutable.
+        assert!(!HudiTableConfig::BasePath.is_immutable());
+        assert!(!HudiTableConfig::Checksum.is_immutable());
+        assert!(HudiTableConfig::TableType.is_immutable());
+        assert!(!HudiTableConfig::MetadataTableEnabled.is_immutable());
     }
 
     #[test]
